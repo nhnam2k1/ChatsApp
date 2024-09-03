@@ -1,0 +1,114 @@
+# You can override the included template(s) by including variable overrides
+# SAST customization: https://docs.gitlab.com/ee/user/application_security/sast/#customizing-the-sast-settings
+# Secret Detection customization: https://docs.gitlab.com/ee/user/application_security/secret_detection/#customizing-settings
+# Dependency Scanning customization: https://docs.gitlab.com/ee/user/application_security/dependency_scanning/#customizing-the-dependency-scanning-settings
+# Container Scanning customization: https://docs.gitlab.com/ee/user/application_security/container_scanning/#customizing-the-container-scanning-settings
+# Note that environment variables can be set in several places
+# See https://docs.gitlab.com/ee/ci/variables/#cicd-variable-precedence
+stages:
+- cleanup
+- pre-test
+- build
+- test
+- deploy
+
+variables:
+  TEMP_TAG: v1.0.1
+  MAIN_TAG: v1.1.1
+
+# Add environment here!
+before_script:
+  - echo PORT=${PORT} >> .env   
+  - echo CLIENT_ORIGIN_URL=${CLIENT_ORIGIN_URL} >> .env         
+  - echo AUTH0_DOMAIN=${AUTH0_DOMAIN} >> .env
+  - echo MONGODB_CONNECTION_STR=${MONGODB_CONNECTION_STR} >> .env
+  - echo AZURE_SERVICE_BUS_CONNECTION_STR=${AZURE_SERVICE_BUS_CONNECTION_STR} >> .env
+  - echo ENCRYPTION_KEY=${ENCRYPTION_KEY} >> .env
+
+clean-up-chat-hub:
+  stage: cleanup
+  script:
+    - cd chatsapp-files
+    - dotnet clean
+    - dotnet clean -c Release
+
+clean-up-tests:
+  stage: cleanup
+  script:
+    - cd chatsapp-files-test
+    - dotnet clean
+    - dotnet clean -c Release
+
+remove-temp-docker-image:
+  stage: cleanup
+  script:
+    - $image_id = docker images -q --no-trunc nhnam123/chatsapp-files:${TEMP_TAG}
+    - docker rmi $image_id
+  allow_failure: true
+
+unit-tests:
+  stage: pre-test
+  script:
+    - cd chatsapp-files-test
+    - dotnet test
+
+sonarqube-check:
+  stage: pre-test
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script: 
+      - set PATH="${PATH}:${HOME}/.dotnet/tools"
+      - dotnet sonarscanner begin -k:"I434265_chatsapp-backend-files_731a2d8f-2859-4ba7-bb54-2024d028f702" -d:sonar.token="${SONAR_TOKEN}" -d:sonar.host.url="${SONAR_HOST_URL}"
+      - dotnet build /nodereuse:false
+      - dotnet sonarscanner end -d:sonar.token="${SONAR_TOKEN}"
+  allow_failure: true
+  only:
+    - main
+
+build-temporary-docker-image:
+  stage: build
+  script:
+    - cd chatsapp-files
+    - docker build -t nhnam123/chatsapp-files:${TEMP_TAG} .
+
+build-main-docker-image:
+  stage: build
+  script:
+    - cd chatsapp-files
+    - docker build -t nhnam123/chatsapp-files:${MAIN_TAG} .
+  only:
+    - main
+
+jmeter-load-tests:
+  stage: test
+  script:
+    - $container_id = docker run -d -p 6090:8080 --env-file .env nhnam123/chatsapp-files:${TEMP_TAG}
+    - jmeter -n -t "ChatsApp-group.jmx" -l "jmeter-report.csv" -e -o "jmeter-dashboard"
+    - docker rm -f $container_id
+  artifacts:
+    paths:
+      - jmeter-report.csv
+      - jmeter-dashboard/
+
+zap-dast-tests:
+  stage: test
+  script:
+    - $container_id = docker run -d -p 6090:8080 --env-file .env nhnam123/chatsapp-files:${TEMP_TAG}
+    - java -Xmx512m -jar "C:\Program Files\ZAP\Zed Attack Proxy\zap-2.15.0.jar" -cmd -silent -quickurl http://localhost:6090/chatHub/files -quickout ./zapReport-files.html -quickprogress
+    - docker rm -f $container_id
+  artifacts:
+    paths:
+      - zapReport-files.html
+
+deploy-to-docker-hub:
+  stage: deploy
+  script:
+    - docker login -u nhnam123 -p ${DOCKER_PASS}
+    - docker push nhnam123/chatsapp-files:${MAIN_TAG}
+  only:
+    - main
